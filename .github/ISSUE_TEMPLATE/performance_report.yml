@@ -1,0 +1,35 @@
+name: Performance report
+description: Report a runtime, memory, or model-quality observation
+title: "[Performance]: "
+labels: ["performance"]
+body:
+  - type: textarea
+    id: task
+    attributes:
+      label: Task and data shape
+      description: Include rows, columns, feature types, class balance, and split method. Do not upload restricted data.
+    validations:
+      required: true
+  - type: textarea
+    id: configuration
+    attributes:
+      label: Configuration
+      description: Include CERM parameters and comparison-model parameters.
+      render: python
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: Result
+      description: Include fit time, prediction time, peak memory, metrics, seeds, and repetitions.
+    validations:
+      required: true
+  - type: textarea
+    id: versions
+    attributes:
+      label: Environment
+      description: Paste `cerm.show_versions()` and hardware information.
+      render: text
+    validations:
+      required: true

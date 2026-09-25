@@ -1,0 +1,248 @@
+name: Native training core
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "src/cerm/_internal/cerm_training_core_runtime.py"
+      - "src/cerm/_internal/native/**"
+      - "src/cerm/training_cache.py"
+      - "scripts/build_training_core_prebuilt.py"
+      - "scripts/make_training_core_platform_wheel.py"
+      - "tests/test_native_training_cache.py"
+      - "pyproject.toml"
+      - ".github/workflows/native-training-core.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  prebuilt:
+    name: Prebuilt / ${{ matrix.os }} / Python 3.12
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform_tag: linux_x86_64
+            macos_target: ""
+          - os: macos-latest
+            platform_tag: macosx_11_0_arm64
+            macos_target: "11.0"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[test]" build
+      - name: Build packaged training core
+        env:
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos_target }}
+        run: python scripts/build_training_core_prebuilt.py
+      - name: Verify macOS minimum deployment target
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          library=$(find src/cerm/_internal/native/prebuilt -name '*.dylib' -print -quit)
+          test -n "$library"
+          otool -l "$library" | grep -A4 LC_BUILD_VERSION | grep -E 'minos[[:space:]]+11\.0'
+      - name: Verify packaged core loads without source compilation
+        shell: bash
+        run: |
+          python - <<'PY'
+          from cerm._internal import cerm_training_core_runtime as runtime
+
+          prebuilt = runtime._prebuilt_library_path()
+          assert prebuilt is not None and prebuilt.is_file(), prebuilt
+          runtime.load_native_training_core.cache_clear()
+
+          def fail_compile():
+              raise AssertionError("source compilation must not run when packaged core exists")
+
+          runtime._compile_cached_library = fail_compile
+          core = runtime.load_native_training_core()
+          assert core.library_path == prebuilt
+          assert core._abi_version() == runtime.ABI_VERSION
+          print(f"prebuilt loaded: {prebuilt}")
+          PY
+      - name: Native exactness tests
+        run: python -m pytest tests/test_native_training_cache.py -q
+      - name: Build platform wheel prototype
+        shell: bash
+        run: |
+          rm -rf dist-base dist-native build
+          python -m build --wheel --outdir dist-base
+          base_wheel=$(find dist-base -maxdepth 1 -name '*.whl' -print -quit)
+          python scripts/make_training_core_platform_wheel.py \
+            "$base_wheel" \
+            --output-dir dist-native \
+            --platform-tag "${{ matrix.platform_tag }}"
+          python - <<'PY'
+          from email.parser import Parser
+          from pathlib import Path
+          import zipfile
+
+          wheels = list(Path("dist-native").glob("*.whl"))
+          assert len(wheels) == 1, wheels
+          wheel = wheels[0]
+          assert "-py3-none-any.whl" not in wheel.name, wheel.name
+          with zipfile.ZipFile(wheel) as archive:
+              wheel_meta = [name for name in archive.namelist() if name.endswith(".dist-info/WHEEL")]
+              assert len(wheel_meta) == 1
+              text = archive.read(wheel_meta[0]).decode("utf-8")
+              metadata = Parser().parsestr(text)
+              assert metadata["Root-Is-Purelib"] == "false"
+              tags = metadata.get_all("Tag")
+              assert tags and len(tags) == 1 and tags[0].startswith("py3-none-")
+              native = [
+                  name for name in archive.namelist()
+                  if "/_internal/native/prebuilt/" in f"/{name}"
+                  and name.endswith((".so", ".dylib", ".dll"))
+              ]
+              assert len(native) == 1, native
+              print(wheel)
+              print(tags[0])
+              print(native[0])
+          PY
+      - name: Install platform wheel and verify compiler-free exact native path
+        shell: bash
+        run: |
+          python -m pip uninstall -y CERM
+          python -m pip install --no-deps --force-reinstall dist-native/*.whl
+          cd "${RUNNER_TEMP}"
+          python - <<'PY'
+          import numpy as np
+          from cerm.training_cache import NewtonHistogramCache
+          from cerm._internal import cerm_training_core_runtime as runtime
+
+          prebuilt = runtime._prebuilt_library_path()
+          assert prebuilt is not None and prebuilt.is_file(), prebuilt
+          assert "site-packages" in str(prebuilt) or "site-packages" in str(prebuilt.resolve())
+          runtime.load_native_training_core.cache_clear()
+
+          def fail_compile():
+              raise AssertionError("installed platform wheel must not source-compile")
+
+          runtime._compile_cached_library = fail_compile
+          rng = np.random.default_rng(20260819)
+          states = rng.integers(0, 8, size=(3000, 12), dtype=np.int16)
+          y = rng.integers(0, 2, size=len(states))
+          p = np.clip(0.05 + 0.9 * rng.random(len(states)), 1e-6, 1 - 1e-6)
+          reference = NewtonHistogramCache(states, y, p, backend="python")
+          native = NewtonHistogramCache(states, y, p, backend="native", n_jobs=4)
+          assert native.backend_ == "native"
+          for left, right in zip(native.main, reference.main):
+              np.testing.assert_array_equal(left.G, right.G)
+              np.testing.assert_array_equal(left.H, right.H)
+          assert tuple(native.pairs) == tuple(reference.pairs)
+          for key in reference.pairs:
+              np.testing.assert_array_equal(native.pairs[key].G, reference.pairs[key].G)
+              np.testing.assert_array_equal(native.pairs[key].H, reference.pairs[key].H)
+          assert native.rank_pairs(20, 5.0) == reference.rank_pairs(20, 5.0)
+          print(f"installed prebuilt exact path: {prebuilt}")
+          PY
+      - run: python -m pip check
+
+  manylinux:
+    name: Manylinux 2.28 / x86_64 / Python 3.12
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build, audit, install, and validate manylinux wheel
+        shell: bash
+        run: |
+          docker run --rm \
+            -v "${PWD}:/io" \
+            -w /io \
+            quay.io/pypa/manylinux_2_28_x86_64 \
+            /bin/bash -euxo pipefail -c '
+              PY=/opt/python/cp312-cp312/bin/python
+              "$PY" -m pip install --upgrade pip build packaging numpy
+
+              rm -rf dist-base dist-linux dist-manylinux build
+              rm -rf src/cerm/_internal/native/prebuilt/linux-x86_64
+
+              "$PY" scripts/build_training_core_prebuilt.py
+              "$PY" -m build --wheel --outdir dist-base
+              base_wheel=$(find dist-base -maxdepth 1 -name "*.whl" -print -quit)
+              "$PY" scripts/make_training_core_platform_wheel.py \
+                "$base_wheel" \
+                --output-dir dist-linux \
+                --platform-tag linux_x86_64
+
+              auditwheel show dist-linux/*.whl
+              auditwheel repair \
+                --plat manylinux_2_28_x86_64 \
+                --wheel-dir dist-manylinux \
+                dist-linux/*.whl
+              auditwheel show dist-manylinux/*.whl
+
+              "$PY" - <<"PY"
+          from email.parser import Parser
+          from pathlib import Path
+          import zipfile
+
+          wheels = list(Path("dist-manylinux").glob("*.whl"))
+          assert len(wheels) == 1, wheels
+          wheel = wheels[0]
+          assert "manylinux" in wheel.name, wheel.name
+          with zipfile.ZipFile(wheel) as archive:
+              wheel_meta = [name for name in archive.namelist() if name.endswith(".dist-info/WHEEL")]
+              assert len(wheel_meta) == 1
+              metadata = Parser().parsestr(archive.read(wheel_meta[0]).decode("utf-8"))
+              assert metadata["Root-Is-Purelib"] == "false"
+              tags = metadata.get_all("Tag") or []
+              assert any("manylinux" in tag for tag in tags), tags
+              native = [
+                  name for name in archive.namelist()
+                  if "/_internal/native/prebuilt/linux-x86_64/" in f"/{name}"
+                  and name.endswith(".so")
+              ]
+              assert len(native) == 1, native
+              print(wheel)
+              print(tags)
+              print(native[0])
+          PY
+
+              "$PY" -m pip install --force-reinstall dist-manylinux/*.whl
+              cd /tmp
+              "$PY" - <<"PY"
+          import numpy as np
+          from cerm.training_cache import NewtonHistogramCache
+          from cerm._internal import cerm_training_core_runtime as runtime
+
+          prebuilt = runtime._prebuilt_library_path()
+          assert prebuilt is not None and prebuilt.is_file(), prebuilt
+          assert "site-packages" in str(prebuilt) or "site-packages" in str(prebuilt.resolve())
+          runtime.load_native_training_core.cache_clear()
+
+          def fail_compile():
+              raise AssertionError("manylinux wheel must not source-compile")
+
+          runtime._compile_cached_library = fail_compile
+          rng = np.random.default_rng(20260819)
+          states = rng.integers(0, 8, size=(5000, 20), dtype=np.int16)
+          y = rng.integers(0, 2, size=len(states))
+          prediction = np.clip(0.05 + 0.9 * rng.random(len(states)), 1e-6, 1 - 1e-6)
+
+          reference = NewtonHistogramCache(states, y, prediction, backend="python")
+          native = NewtonHistogramCache(states, y, prediction, backend="native", n_jobs=4)
+          assert native.backend_ == "native"
+          assert native.feature_names == reference.feature_names
+          assert native.nbytes == reference.nbytes
+          for left, right in zip(native.main, reference.main):
+              np.testing.assert_array_equal(left.G, right.G)
+              np.testing.assert_array_equal(left.H, right.H)
+          assert tuple(native.pairs) == tuple(reference.pairs)
+          for key in reference.pairs:
+              np.testing.assert_array_equal(native.pairs[key].G, reference.pairs[key].G)
+              np.testing.assert_array_equal(native.pairs[key].H, reference.pairs[key].H)
+          assert native.rank_pairs(30, 5.0) == reference.rank_pairs(30, 5.0)
+          print(f"manylinux installed prebuilt exact path: {prebuilt}")
+          PY
+              "$PY" -m pip check
+            '

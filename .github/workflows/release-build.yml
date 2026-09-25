@@ -1,0 +1,271 @@
+name: Build and publish release
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/release-build.yml"
+      - "scripts/build_training_core_prebuilt.py"
+      - "scripts/make_training_core_platform_wheel.py"
+      - "scripts/verify_distributions.py"
+      - "src/cerm/_internal/cerm_training_core_runtime.py"
+      - "src/cerm/_internal/native/**"
+      - "src/cerm/training_cache.py"
+      - "pyproject.toml"
+      - "MANIFEST.in"
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  portable:
+    name: Portable wheel and sdist
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Verify release tag matches package version
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          version=$(python -c "import runpy; print(runpy.run_path('src/cerm/_version.py')['__version__'])")
+          expected="v${version}"
+          if [ "${GITHUB_REF_NAME}" != "${expected}" ]; then
+            echo "release tag ${GITHUB_REF_NAME} does not match package version ${expected}" >&2
+            exit 1
+          fi
+      - run: python -m pip install --upgrade pip build twine packaging
+      - run: python scripts/check_package.py
+      - run: python scripts/check_documentation.py
+      - name: Build portable fallback distributions
+        shell: bash
+        run: |
+          find . -type d -name __pycache__ -prune -exec rm -rf {} +
+          rm -rf src/cerm/_internal/native/prebuilt dist build
+          python -m build
+      - run: python scripts/verify_distributions.py dist/*
+      - name: Verify portable wheel contains source but no packaged binary
+        shell: bash
+        run: |
+          python - <<'PY'
+          from email.parser import Parser
+          from pathlib import Path
+          import zipfile
+
+          wheels = list(Path("dist").glob("*.whl"))
+          assert len(wheels) == 1, wheels
+          wheel = wheels[0]
+          assert wheel.name.endswith("-py3-none-any.whl"), wheel.name
+          with zipfile.ZipFile(wheel) as archive:
+              names = archive.namelist()
+              assert "cerm/_internal/native/cerm_training_core.cpp" in names
+              binaries = [name for name in names if name.endswith((".so", ".dylib", ".dll"))]
+              assert not binaries, binaries
+              wheel_meta = [name for name in names if name.endswith(".dist-info/WHEEL")]
+              assert len(wheel_meta) == 1
+              metadata = Parser().parsestr(archive.read(wheel_meta[0]).decode("utf-8"))
+              assert metadata["Root-Is-Purelib"] == "true"
+              assert metadata.get_all("Tag") == ["py3-none-any"]
+          print(wheel)
+          PY
+      - run: python -m twine check dist/*
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cerm-release-portable
+          path: dist/*
+          if-no-files-found: error
+
+  macos-arm64:
+    name: macOS arm64 native wheel
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Require Apple Silicon runner
+        shell: bash
+        run: test "$(uname -m)" = "arm64"
+      - run: python -m pip install --upgrade pip build twine packaging
+      - name: Build macOS 11+ packaged training core
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+        run: python scripts/build_training_core_prebuilt.py
+      - name: Verify macOS minimum deployment target
+        shell: bash
+        run: |
+          library=$(find src/cerm/_internal/native/prebuilt -name '*.dylib' -print -quit)
+          test -n "$library"
+          otool -l "$library" | grep -A4 LC_BUILD_VERSION | grep -E 'minos[[:space:]]+11\.0'
+      - name: Build macOS platform wheel
+        shell: bash
+        run: |
+          rm -rf dist-base dist-macos build
+          python -m build --wheel --outdir dist-base
+          base_wheel=$(find dist-base -maxdepth 1 -name '*.whl' -print -quit)
+          python scripts/make_training_core_platform_wheel.py \
+            "$base_wheel" \
+            --output-dir dist-macos \
+            --platform-tag macosx_11_0_arm64
+      - run: python scripts/verify_distributions.py dist-macos/*
+      - run: python -m twine check dist-macos/*
+      - name: Fresh-install macOS wheel and verify compiler-free exact path
+        shell: bash
+        run: |
+          python -m pip install --force-reinstall dist-macos/*.whl
+          cd "${RUNNER_TEMP}"
+          python - <<'PY'
+          import numpy as np
+          from cerm.training_cache import NewtonHistogramCache
+          from cerm._internal import cerm_training_core_runtime as runtime
+
+          prebuilt = runtime._prebuilt_library_path()
+          assert prebuilt is not None and prebuilt.is_file(), prebuilt
+          runtime.load_native_training_core.cache_clear()
+
+          def fail_compile():
+              raise AssertionError("release macOS wheel must not source-compile")
+
+          runtime._compile_cached_library = fail_compile
+          rng = np.random.default_rng(20260819)
+          states = rng.integers(0, 8, size=(3000, 12), dtype=np.int16)
+          y = rng.integers(0, 2, size=len(states))
+          prediction = np.clip(0.05 + 0.9 * rng.random(len(states)), 1e-6, 1 - 1e-6)
+          reference = NewtonHistogramCache(states, y, prediction, backend="python")
+          native = NewtonHistogramCache(states, y, prediction, backend="native", n_jobs=4)
+          assert native.backend_ == "native"
+          for left, right in zip(native.main, reference.main):
+              np.testing.assert_array_equal(left.G, right.G)
+              np.testing.assert_array_equal(left.H, right.H)
+          assert tuple(native.pairs) == tuple(reference.pairs)
+          for key in reference.pairs:
+              np.testing.assert_array_equal(native.pairs[key].G, reference.pairs[key].G)
+              np.testing.assert_array_equal(native.pairs[key].H, reference.pairs[key].H)
+          assert native.rank_pairs(20, 5.0) == reference.rank_pairs(20, 5.0)
+          print(f"macOS release wheel exact path: {prebuilt}")
+          PY
+          python -m pip check
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cerm-release-macos-arm64
+          path: dist-macos/*
+          if-no-files-found: error
+
+  manylinux-x86_64:
+    name: manylinux x86_64 native wheel
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build, audit, fresh-install, and validate manylinux wheel
+        shell: bash
+        run: |
+          docker run --rm \
+            -v "${PWD}:/io" \
+            -w /io \
+            quay.io/pypa/manylinux_2_28_x86_64 \
+            /bin/bash -euxo pipefail -c '
+              PY=/opt/python/cp312-cp312/bin/python
+              "$PY" -m pip install --upgrade pip build packaging twine numpy
+
+              rm -rf src/cerm/_internal/native/prebuilt/linux-x86_64
+              rm -rf dist-base dist-linux dist-manylinux build
+              "$PY" scripts/build_training_core_prebuilt.py
+              "$PY" -m build --wheel --outdir dist-base
+              base_wheel=$(find dist-base -maxdepth 1 -name "*.whl" -print -quit)
+              "$PY" scripts/make_training_core_platform_wheel.py \
+                "$base_wheel" \
+                --output-dir dist-linux \
+                --platform-tag linux_x86_64
+
+              auditwheel show dist-linux/*.whl
+              auditwheel repair \
+                --plat manylinux_2_28_x86_64 \
+                --wheel-dir dist-manylinux \
+                dist-linux/*.whl
+              auditwheel show dist-manylinux/*.whl
+              "$PY" scripts/verify_distributions.py dist-manylinux/*
+              "$PY" -m twine check dist-manylinux/*
+
+              "$PY" -m pip install --force-reinstall dist-manylinux/*.whl
+              cd /tmp
+              "$PY" - <<"PY"
+          import numpy as np
+          from cerm.training_cache import NewtonHistogramCache
+          from cerm._internal import cerm_training_core_runtime as runtime
+
+          prebuilt = runtime._prebuilt_library_path()
+          assert prebuilt is not None and prebuilt.is_file(), prebuilt
+          runtime.load_native_training_core.cache_clear()
+
+          def fail_compile():
+              raise AssertionError("release manylinux wheel must not source-compile")
+
+          runtime._compile_cached_library = fail_compile
+          rng = np.random.default_rng(20260819)
+          states = rng.integers(0, 8, size=(5000, 20), dtype=np.int16)
+          y = rng.integers(0, 2, size=len(states))
+          prediction = np.clip(0.05 + 0.9 * rng.random(len(states)), 1e-6, 1 - 1e-6)
+          reference = NewtonHistogramCache(states, y, prediction, backend="python")
+          native = NewtonHistogramCache(states, y, prediction, backend="native", n_jobs=4)
+          assert native.backend_ == "native"
+          assert native.feature_names == reference.feature_names
+          assert native.nbytes == reference.nbytes
+          for left, right in zip(native.main, reference.main):
+              np.testing.assert_array_equal(left.G, right.G)
+              np.testing.assert_array_equal(left.H, right.H)
+          assert tuple(native.pairs) == tuple(reference.pairs)
+          for key in reference.pairs:
+              np.testing.assert_array_equal(native.pairs[key].G, reference.pairs[key].G)
+              np.testing.assert_array_equal(native.pairs[key].H, reference.pairs[key].H)
+          assert native.rank_pairs(30, 5.0) == reference.rank_pairs(30, 5.0)
+          print(f"manylinux release wheel exact path: {prebuilt}")
+          PY
+              "$PY" -m pip check
+            '
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cerm-release-manylinux-x86_64
+          path: dist-manylinux/*
+          if-no-files-found: error
+
+  publish:
+    name: Upload release to PyPI
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - portable
+      - macos-arm64
+      - manylinux-x86_64
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/CERM
+    permissions:
+      id-token: write
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: cerm-release-*
+          path: dist
+          merge-multiple: true
+      - name: Show release set
+        shell: bash
+        run: |
+          ls -lah dist
+          test "$(find dist -maxdepth 1 -type f -name '*.whl' | wc -l | tr -d ' ')" -eq 3
+          test "$(find dist -maxdepth 1 -type f -name '*.tar.gz' | wc -l | tr -d ' ')" -eq 1
+      - name: Publish package distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@v1.14.2

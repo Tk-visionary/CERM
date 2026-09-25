@@ -1,0 +1,20 @@
+* text=auto eol=lf
+*.bat text eol=crlf
+*.csv -text -whitespace
+*.npz binary
+*.md text
+*.toml text
+*.py text
+
+# Preserve supplied archives, manifests, patches, and historical evidence bytes.
+artifacts/* binary
+manifest.csv -text -diff
+undr/upstream_manifest.csv -text -diff
+undr/results/*.csv -text
+patches/*.patch -text -diff -whitespace
+undr/patches/*.patch -text -diff -whitespace
+generalized_exact_rewrite.patch -text -diff -whitespace
+
+# These two manifested source files intentionally contain a final blank line.
+src/cerm/_internal/cerm_hybrid_quotient_block.py -whitespace
+src/cerm/program.py -whitespace

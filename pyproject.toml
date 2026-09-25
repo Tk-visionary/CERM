@@ -1,0 +1,131 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "CERM"
+dynamic = ["version"]
+description = "Compiler-oriented finite-state models for tabular classification and regression"
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+license = "Apache-2.0"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md", "LICENSES/*"]
+authors = [{name = "Taishi Kawahara"}]
+maintainers = [{name = "Taishi Kawahara"}]
+keywords = [
+  "tabular-data",
+  "classification",
+  "regression",
+  "multilabel-classification",
+  "finite-state-models",
+  "scikit-learn",
+  "model-compilation",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+  "numpy>=1.24,<3",
+  "scipy>=1.10,<2",
+  "pandas>=2.0,<4",
+  "scikit-learn>=1.6,<2.0",
+  "joblib>=1.3,<2",
+  "threadpoolctl>=3.1,<4",
+]
+
+[project.urls]
+Homepage = "https://github.com/Tk-visionary/CERM"
+Documentation = "https://github.com/Tk-visionary/CERM/tree/main/docs"
+Repository = "https://github.com/Tk-visionary/CERM"
+Issues = "https://github.com/Tk-visionary/CERM/issues"
+Changelog = "https://github.com/Tk-visionary/CERM/blob/main/CHANGELOG.md"
+
+[project.optional-dependencies]
+test = [
+  "pytest>=8,<10",
+  "pytest-cov>=5,<8",
+  "packaging>=23,<27",
+  "tomli>=2,<3; python_version < '3.11'",
+]
+dev = [
+  "pytest>=8,<10",
+  "pytest-cov>=5,<8",
+  "ruff>=0.5,<1",
+  "build>=1.2,<2",
+  "twine>=5,<8",
+  "packaging>=23,<27",
+  "tomli>=2,<3; python_version < '3.11'",
+]
+docs = [
+  "mkdocs>=1.6,<2",
+  "mkdocs-material>=9.5,<10",
+]
+
+[tool.setuptools.dynamic]
+version = {attr = "cerm._version.__version__"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["cerm*"]
+
+[tool.setuptools.package-data]
+cerm = [
+  "_internal/native/*.cpp",
+  "_internal/native/prebuilt/*/*.so",
+  "_internal/native/prebuilt/*/*.dylib",
+  "_internal/native/prebuilt/*/*.dll",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q --strict-markers --strict-config"
+filterwarnings = [
+  "error::pytest.PytestUnraisableExceptionWarning",
+  "error::pytest.PytestUnhandledThreadExceptionWarning",
+]
+
+[tool.coverage.run]
+source = ["cerm"]
+branch = true
+parallel = true
+omit = [
+  "src/cerm/_internal/cerm_embedding_graph_fusion.py",
+  "src/cerm/_internal/cerm_embedding_native_codegen.py",
+  "src/cerm/_internal/cerm_graph_autotune_v2.py",
+  "src/cerm/_internal/cerm_graph_native_codegen.py",
+]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+fail_under = 70
+exclude_lines = [
+  "pragma: no cover",
+  "if TYPE_CHECKING:",
+  "raise NotImplementedError",
+]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+extend-exclude = [
+  "src/cerm/_internal",
+]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
+ignore = ["E401", "E402", "E701", "E702", "E703", "E741", "F401", "F841", "I001"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E501"]
+"examples/intuitive_parameters.py" = ["F821"]
+"examples/weighted_classification.py" = ["F821"]

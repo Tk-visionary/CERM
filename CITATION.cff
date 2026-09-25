@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+message: "If you use CERM in research, please cite this software."
+title: "CERM"
+type: software
+authors:
+  - family-names: "Kawahara"
+    given-names: "Taishi"
+version: "1.0.0a1"
+license: "Apache-2.0"
+repository-code: "https://github.com/Tk-visionary/CERM"
+url: "https://github.com/Tk-visionary/CERM"
+abstract: >-
+  CERM is an experimental compiler-aware finite-state learner for tabular
+  classification and regression, with auditable semantic programs, independent
+  multi-output bundles, and separate training and inference optimizations.
+keywords:
+  - tabular machine learning
+  - classification
+  - regression
+  - multilabel classification
+  - finite-state models
+  - model compilation
+  - scikit-learn

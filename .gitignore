@@ -1,0 +1,53 @@
+__pycache__/
+*.py[cod]
+*.so
+*.dylib
+*.dll
+*.egg-info/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+build/
+dist/
+.venv/
+venv/
+*.joblib
+*.npz
+.DS_Store
+
+# Local package/release artifacts.
+/artifacts/
+/evidence/
+/reports/
+/provenance/
+/patches/
+/*.patch
+/manifest.csv
+
+# Local validation outputs and OpenML caches.
+.openml/
+openml_binary30_results.csv
+openml_binary30_results.failures.csv
+openml_binary30_results.summary.json
+runtime_scaling_results.csv
+runtime_scaling_results.summary.json
+runtime_scaling_v2_results.csv
+runtime_scaling_v2_results.summary.json
+candidate_scan_benchmark.json
+undr_installed_cerm_smoke.json
+strong_synthetic_*.json
+
+# Generated benchmark outputs. Keep preregistrations, protocol locks, manifests,
+# benchmark code, and README files under version control; generate result tables
+# locally or in CI/release artifacts.
+/benchmarks/results/
+/benchmarks/undr_openml_binary30/
+/benchmarks/undr_candidate_scan/
+/benchmarks/undr_runtime_scaling/
+/benchmarks/undr_runtime_scaling_v2/
+/benchmarks/undr_openml_binary150/results.csv
+/benchmarks/undr_openml_binary150/results.failures.csv
+/benchmarks/undr_openml_binary150/results.gates.csv
+/benchmarks/undr_openml_binary150/results.summary.json
+/undr/results/

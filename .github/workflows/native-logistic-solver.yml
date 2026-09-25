@@ -1,0 +1,63 @@
+name: Native logistic solver
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "src/cerm/_compat/sklearn.py"
+      - "src/cerm/_internal/cerm_training_core_runtime.py"
+      - "src/cerm/_internal/native/**"
+      - "scripts/build_training_core_prebuilt.py"
+      - "tests/test_native_logistic_solver.py"
+      - ".github/workflows/native-logistic-solver.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  exactness:
+    name: Exact CSR L2R_LR / ${{ matrix.os }} / Python 3.12
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            macos_target: ""
+          - os: macos-latest
+            macos_target: "11.0"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[test]"
+      - name: Build packaged ABI-v2 training core
+        env:
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos_target }}
+        run: python scripts/build_training_core_prebuilt.py
+      - name: Require packaged ABI v2 and disable source compile
+        shell: bash
+        run: |
+          python - <<'PY'
+          from cerm._internal import cerm_training_core_runtime as runtime
+
+          prebuilt = runtime._prebuilt_library_path()
+          assert prebuilt is not None and prebuilt.is_file(), prebuilt
+          runtime.load_native_training_core.cache_clear()
+
+          def fail_compile():
+              raise AssertionError("solver exactness CI must use the packaged prebuilt")
+
+          runtime._compile_cached_library = fail_compile
+          core = runtime.load_native_training_core()
+          assert core.library_path == prebuilt
+          assert core._abi_version() == runtime.ABI_VERSION == 2
+          print(f"ABI-v2 prebuilt: {prebuilt}")
+          PY
+      - name: Compare CSR-direct solver with historical LIBLINEAR bitwise
+        run: python -m pytest tests/test_native_logistic_solver.py -q

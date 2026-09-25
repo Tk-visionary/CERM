@@ -1,0 +1,1133 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+import hashlib
+import json
+from pathlib import Path
+from typing import Any, Sequence
+
+import numpy as np
+import pandas as pd
+from joblib import Parallel, delayed, effective_n_jobs
+from scipy import sparse
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import log_loss
+from sklearn.model_selection import train_test_split
+
+from ._internal.cerm_hierarchical_residual import (
+    NestedQuantileEncoder,
+    _pair_parent_map,
+    _parent_labels_from_fine,
+    _residual_state_map,
+)
+from ._internal.cerm_state_design import ReferenceStateEncoder
+from ._internal.cerm_typed_quotient_adapters_v4 import export_typed_adapter_ir
+from .training_graph import EncodedColumnBank, fit_binary_logistic_exact
+from .validation import dense_numeric_matrix, validate_dataframe_schema
+
+
+@dataclass(frozen=True)
+class SharedStructureConfig:
+    n_pairs: int
+    n_fine_pairs: int
+    max_main_level: int
+    C: float
+    pair_aggregation: str = "joint"
+    multiclass_objective: str = "ovr"
+
+
+def _finite_mi(code: np.ndarray, target: np.ndarray, n_classes: int | None = None) -> float:
+    code = np.asarray(code, dtype=np.int64).reshape(-1)
+    target = np.asarray(target, dtype=np.int64).reshape(-1)
+    if len(code) != len(target):
+        raise ValueError("code and target length mismatch")
+    if np.any(code < 0) or np.any(target < 0):
+        raise ValueError("finite MI requires non-negative integer values")
+    card = int(code.max(initial=0)) + 1
+    classes = int(n_classes or (target.max(initial=0) + 1))
+    joint = np.bincount(code * classes + target, minlength=card * classes).reshape(card, classes)
+    n = float(len(code))
+    if n <= 0:
+        return 0.0
+    pxy = joint / n
+    px = pxy.sum(axis=1, keepdims=True)
+    py = pxy.sum(axis=0, keepdims=True)
+    denom = px @ py
+    mask = pxy > 0
+    return float(np.sum(pxy[mask] * np.log(pxy[mask] / denom[mask])))
+
+
+def _aggregate_feature_scores(states: np.ndarray, y: np.ndarray, task_type: str) -> np.ndarray:
+    if task_type == "multiclass":
+        encoded = np.asarray(y, dtype=np.int64)
+        classes = int(encoded.max(initial=0)) + 1
+        return np.asarray([_finite_mi(states[:, j], encoded, classes) for j in range(states.shape[1])])
+    labels = np.asarray(y, dtype=np.int64)
+    values = np.zeros(states.shape[1], dtype=np.float64)
+    active = 0
+    for column in range(labels.shape[1]):
+        target = labels[:, column]
+        if np.unique(target).size < 2:
+            continue
+        values += np.asarray([_finite_mi(states[:, j], target, 2) for j in range(states.shape[1])])
+        active += 1
+    return values / max(active, 1)
+
+
+def _rank_pairs(
+    states: np.ndarray,
+    y: np.ndarray,
+    task_type: str,
+    limit: int,
+    feature_limit: int,
+    aggregation: str,
+):
+    d = min(states.shape[1], int(feature_limit))
+    if d < 2 or limit <= 0:
+        return []
+    cards = states[:, :d].max(axis=0, initial=0).astype(np.int64) + 1
+    ranked = []
+    if task_type == "multiclass" and aggregation == "joint":
+        marginal = _aggregate_feature_scores(states[:, :d], y, task_type)
+        classes = int(np.max(y, initial=0)) + 1
+        for j in range(d):
+            left = states[:, j].astype(np.int64, copy=False)
+            for k in range(j + 1, d):
+                joint = left * int(cards[k]) + states[:, k]
+                score = _finite_mi(joint, y, classes)
+                ranked.append((score - max(marginal[j], marginal[k]), score, j, k))
+    else:
+        outputs = []
+        if task_type == "multiclass":
+            for cls in np.unique(y):
+                outputs.append((y == cls).astype(np.int32))
+        else:
+            outputs = [y[:, output] for output in range(y.shape[1]) if np.unique(y[:, output]).size == 2]
+        marginal_by_output = [
+            np.asarray([_finite_mi(states[:, j], target, 2) for j in range(d)])
+            for target in outputs
+        ]
+        for j in range(d):
+            left = states[:, j].astype(np.int64, copy=False)
+            for k in range(j + 1, d):
+                joint = left * int(cards[k]) + states[:, k]
+                values = []
+                raw = []
+                for target, marginal in zip(outputs, marginal_by_output):
+                    score = _finite_mi(joint, target, 2)
+                    raw.append(score)
+                    values.append(score - max(marginal[j], marginal[k]))
+                if not values:
+                    aggregate = score = 0.0
+                elif aggregation == "max":
+                    aggregate = float(np.max(values)); score = float(np.max(raw))
+                elif aggregation == "mean_max":
+                    aggregate = 0.5 * float(np.mean(values)) + 0.5 * float(np.max(values))
+                    score = 0.5 * float(np.mean(raw)) + 0.5 * float(np.max(raw))
+                else:
+                    aggregate = float(np.mean(values)); score = float(np.mean(raw))
+                ranked.append((aggregate, score, j, k))
+    ranked.sort(reverse=True)
+    return [(j, k) for _, _, j, k in ranked[: int(limit)]]
+
+
+def _softmax(logits: np.ndarray) -> np.ndarray:
+    logits = np.asarray(logits, dtype=np.float64)
+    shifted = logits - np.max(logits, axis=1, keepdims=True)
+    exp = np.exp(np.clip(shifted, -50.0, 50.0))
+    total = exp.sum(axis=1, keepdims=True)
+    return np.divide(exp, total, out=np.full_like(exp, 1.0 / exp.shape[1]), where=total > 0)
+
+
+class SharedFiniteStateModel:
+    """One finite-state representation with vector-valued output heads."""
+
+    def __init__(
+        self,
+        *,
+        task_type: str,
+        max_features: int = 64,
+        pair_feature_limit: int = 24,
+        max_bins: int = 16,
+        random_state: int = 20260803,
+        feature_kinds: Sequence[str] | None = None,
+        feature_cardinalities: Sequence[int | None] | None = None,
+        threshold: float | Sequence[float] = 0.5,
+        max_pairs: int = 30,
+        fixed_C: float | None = None,
+        search_profile: str = "full_exact",
+        selection_subsample: float = 1.0,
+        n_jobs: int | None = 1,
+        output_aggregation: str | None = None,
+        multiclass_objective: str = "ovr",
+    ):
+        if task_type not in {"multiclass", "multilabel"}:
+            raise ValueError("task_type must be multiclass or multilabel")
+        self.task_type = task_type
+        self.max_features = int(max_features)
+        self.pair_feature_limit = int(pair_feature_limit)
+        self.max_bins = int(max_bins)
+        self.levels = tuple(level for level in (4, 8, 16) if level <= self.max_bins)
+        self.ranking_level = 8 if self.max_bins >= 8 else 4
+        self.random_state = int(random_state)
+        self.feature_kinds = feature_kinds
+        self.feature_cardinalities = feature_cardinalities
+        self.threshold = threshold
+        self.max_pairs = max(0, int(max_pairs))
+        self.fixed_C = None if fixed_C is None else float(fixed_C)
+        self.search_profile = str(search_profile)
+        self.selection_subsample = float(selection_subsample)
+        self.n_jobs = n_jobs
+        self.multiclass_objective = str(multiclass_objective)
+        if self.multiclass_objective not in {"auto", "ovr", "multinomial"}:
+            raise ValueError("multiclass_objective must be auto, ovr, or multinomial")
+        if self.task_type != "multiclass" and self.multiclass_objective != "ovr":
+            raise ValueError("multiclass_objective applies only to multiclass models")
+        self.output_aggregation = (
+            ("joint" if task_type == "multiclass" else "mean")
+            if output_aggregation is None else str(output_aggregation)
+        )
+        if self.output_aggregation not in {"auto", "joint", "mean", "max", "mean_max"}:
+            raise ValueError("invalid output_aggregation")
+
+    def _objective_candidates(self) -> tuple[str, ...]:
+        if self.task_type != "multiclass":
+            return ("ovr",)
+        if self.multiclass_objective == "auto":
+            return ("ovr", "multinomial")
+        return (self.multiclass_objective,)
+
+    def _aggregation_candidates(self) -> tuple[str, ...]:
+        if self.output_aggregation != "auto":
+            return (self.output_aggregation,)
+        if self.task_type == "multiclass":
+            return ("joint", "mean")
+        return ("mean", "max")
+
+    def _new_encoder(self):
+        return NestedQuantileEncoder(
+            max_bins=self.max_bins,
+            levels=self.levels,
+            feature_kinds=self.feature_kinds,
+            feature_cardinalities=self.feature_cardinalities,
+        )
+
+    def _configs(self):
+        C_values = [self.fixed_C] if self.fixed_C is not None else [0.2, 1.0]
+        main_levels = [min(8, self.max_bins), self.max_bins]
+        pair_prefixes = []
+        if self.max_pairs > 0:
+            base = (10, 30) if self.search_profile in {"practical", "aggressive"} else (10, 20, 30)
+            pair_prefixes = list(dict.fromkeys(min(self.max_pairs, value) for value in base if min(self.max_pairs, value) > 0))
+            if self.max_pairs not in pair_prefixes:
+                pair_prefixes.append(self.max_pairs)
+        aggregations = self._aggregation_candidates()
+        objectives = self._objective_candidates()
+        configs = []
+        for objective in objectives:
+            # Main-only candidates do not depend on pair ranking. Keep one copy
+            # per head objective because their statistical objectives differ.
+            main_aggregation = aggregations[0]
+            for level in dict.fromkeys(main_levels):
+                for C in C_values:
+                    configs.append(SharedStructureConfig(
+                        0, 0, int(level), float(C), main_aggregation, objective
+                    ))
+            for aggregation in aggregations:
+                for n_pairs in pair_prefixes:
+                    for C in C_values:
+                        configs.append(SharedStructureConfig(
+                            int(n_pairs), 0, self.max_bins, float(C), aggregation, objective
+                        ))
+                if self.max_bins == 16 and self.max_pairs > 0 and self.search_profile == "full_exact":
+                    fine = min(5, self.max_pairs)
+                    for C in C_values:
+                        configs.append(SharedStructureConfig(
+                            self.max_pairs, fine, 16, float(C), aggregation, objective
+                        ))
+        return list(dict.fromkeys(configs))
+
+    def _selection_indices(self, y: np.ndarray):
+        if self.selection_subsample >= 1.0:
+            return np.arange(len(y), dtype=np.int64)
+        rng = np.random.default_rng(self.random_state + 49979687)
+        if self.task_type == "multiclass":
+            selected = []
+            for cls in np.unique(y):
+                idx = np.flatnonzero(y == cls)
+                keep = min(len(idx), max(8, int(np.ceil(self.selection_subsample * len(idx)))))
+                if keep < len(idx):
+                    idx = rng.choice(idx, size=keep, replace=False)
+                selected.append(np.asarray(idx, dtype=np.int64))
+            indices = np.concatenate(selected)
+        else:
+            keep = min(len(y), max(16, int(np.ceil(self.selection_subsample * len(y)))))
+            indices = rng.choice(len(y), size=keep, replace=False) if keep < len(y) else np.arange(len(y))
+        rng.shuffle(indices)
+        return np.asarray(indices, dtype=np.int64)
+
+    def _prepare_residual_maps(self):
+        self.main_residuals_ = {}
+        for level, parent in zip(self.levels[1:], self.levels[:-1]):
+            maps = []
+            for raw_j in self.feature_idx_:
+                child_map = self.encoder_.maps_[level][raw_j]
+                parent_map = self.encoder_.maps_[parent][raw_j]
+                child_card = int(self.encoder_.cardinalities_[level][raw_j])
+                labels = _parent_labels_from_fine(child_map, parent_map, child_card)
+                maps.append(_residual_state_map(labels))
+            self.main_residuals_[level] = maps
+        self.pair_residuals_ = {level: {} for level in self.levels[1:]}
+        fine_pairs = set(self.fine_pairs_)
+        for j, k in self.pairs_:
+            raw_j, raw_k = int(self.feature_idx_[j]), int(self.feature_idx_[k])
+            for level, parent in zip(self.levels[1:], self.levels[:-1]):
+                if level > 8 and (j, k) not in fine_pairs:
+                    continue
+                cj = int(self.encoder_.cardinalities_[level][raw_j])
+                ck = int(self.encoder_.cardinalities_[level][raw_k])
+                parent_ck = int(self.encoder_.cardinalities_[parent][raw_k])
+                pj = _parent_labels_from_fine(self.encoder_.maps_[level][raw_j], self.encoder_.maps_[parent][raw_j], cj)
+                pk = _parent_labels_from_fine(self.encoder_.maps_[level][raw_k], self.encoder_.maps_[parent][raw_k], ck)
+                parent_map = _pair_parent_map(cj, ck, pj, pk, parent_ck)
+                self.pair_residuals_[level][(j, k)] = _residual_state_map(parent_map)
+
+    def _build_codes(self, selected_states: dict[int, np.ndarray], config: SharedStructureConfig) -> np.ndarray:
+        coarse = self.levels[0]
+        main_levels = [level for level in self.levels if level <= config.max_main_level]
+        pair_levels = [level for level in self.levels if level <= min(self.max_bins, 8)]
+        n_columns = selected_states[coarse].shape[1] * len(main_levels)
+        n_columns += len(self.pairs_) * len(pair_levels)
+        n_columns += len(self.fine_pairs_) * int(16 in self.levels)
+        codes = np.empty((len(selected_states[coarse]), max(n_columns, 1)), dtype=np.int32)
+        if n_columns == 0:
+            codes[:, 0] = 0
+            return codes
+        col = 0
+        for j in range(selected_states[coarse].shape[1]):
+            codes[:, col] = selected_states[coarse][:, j]
+            col += 1
+            for level in main_levels[1:]:
+                codes[:, col] = self.main_residuals_[level][j][selected_states[level][:, j]]
+                col += 1
+        fine_pairs = set(self.fine_pairs_)
+        for j, k in self.pairs_:
+            raw_j, raw_k = int(self.feature_idx_[j]), int(self.feature_idx_[k])
+            for level in pair_levels:
+                card_k = int(self.encoder_.cardinalities_[level][raw_k])
+                joint = selected_states[level][:, j].astype(np.int64) * card_k + selected_states[level][:, k]
+                if level == coarse:
+                    codes[:, col] = joint
+                else:
+                    codes[:, col] = self.pair_residuals_[level][(j, k)][joint]
+                col += 1
+            if 16 in self.levels and (j, k) in fine_pairs:
+                card_k = int(self.encoder_.cardinalities_[16][raw_k])
+                joint = selected_states[16][:, j].astype(np.int64) * card_k + selected_states[16][:, k]
+                codes[:, col] = self.pair_residuals_[16][(j, k)][joint]
+                col += 1
+        if col != n_columns:
+            raise RuntimeError("shared finite-state code layout mismatch")
+        return codes
+
+    def _parallel_head_results(self, functions):
+        jobs = effective_n_jobs(self.n_jobs)
+        if jobs == 1 or len(functions) <= 1:
+            return [function() for function in functions]
+        return Parallel(n_jobs=jobs, prefer="threads")(
+            delayed(function)() for function in functions
+        )
+
+    @staticmethod
+    def _fused_head_scores(fitted, design: sparse.csr_matrix):
+        n_outputs = len(fitted)
+        n_features = int(design.shape[1])
+        coef = np.zeros((n_outputs, n_features), dtype=np.float64)
+        intercept = np.zeros(n_outputs, dtype=np.float64)
+        constants = np.full(n_outputs, np.nan, dtype=np.float64)
+        for output, model in enumerate(fitted):
+            if isinstance(model, float):
+                constants[output] = float(model)
+            else:
+                coef[output] = np.asarray(model.coef_[0], dtype=np.float64)
+                intercept[output] = float(model.intercept_[0])
+        scores = np.asarray(design @ coef.T, dtype=np.float64)
+        scores += intercept
+        return scores, constants
+
+    def _probability_from_fitted(self, fitted, design: sparse.csr_matrix):
+        if self.task_type == "multiclass" and not isinstance(fitted, (list, tuple)):
+            scores = np.asarray(design @ np.asarray(fitted.coef_, dtype=np.float64).T, dtype=np.float64)
+            scores += np.asarray(fitted.intercept_, dtype=np.float64)
+            return _softmax(scores)
+        scores, constants = self._fused_head_scores(fitted, design)
+        if self.task_type == "multiclass":
+            return _softmax(scores)
+        probability = 1.0 / (1.0 + np.exp(-np.clip(scores, -40.0, 40.0)))
+        for output, value in enumerate(constants):
+            if np.isfinite(value):
+                probability[:, output] = value
+        return probability
+
+    def _fit_outputs(self, design: sparse.csr_matrix, y: np.ndarray, C: float, objective: str | None = None):
+        if self.task_type == "multiclass":
+            objective = self.multiclass_objective if objective is None else str(objective)
+            if objective == "auto":
+                raise RuntimeError("auto objective must be resolved before fitting outputs")
+            if objective == "multinomial":
+                model = LogisticRegression(
+                    solver="newton-cg",
+                    C=float(C),
+                    tol=1e-7,
+                    max_iter=500,
+                    random_state=self.random_state,
+                ).fit(design, y)
+                return model, self._probability_from_fitted(model, design)
+            n_classes = int(np.max(y, initial=0)) + 1
+
+            def make_fit(output):
+                def fit_one():
+                    target = (y == output).astype(np.int32)
+                    return fit_binary_logistic_exact(
+                        design, target, C=float(C),
+                        random_state=self.random_state + 104729 * output,
+                        max_iter=2500,
+                    )
+                return fit_one
+
+            models = self._parallel_head_results(
+                [make_fit(output) for output in range(n_classes)]
+            )
+            return models, self._probability_from_fitted(models, design)
+
+        def make_fit(output):
+            def fit_one():
+                target = y[:, output]
+                unique = np.unique(target)
+                if len(unique) == 1:
+                    return float(unique[0])
+                return fit_binary_logistic_exact(
+                    design, target, C=float(C),
+                    random_state=self.random_state + 104729 * output,
+                    max_iter=2500,
+                )
+            return fit_one
+
+        models = self._parallel_head_results(
+            [make_fit(output) for output in range(y.shape[1])]
+        )
+        return models, self._probability_from_fitted(models, design)
+
+    def _validation_probability(self, fitted, valid_design):
+        return self._probability_from_fitted(fitted, valid_design)
+
+    def _loss(self, y, probability):
+        if self.task_type == "multiclass":
+            labels = np.arange(probability.shape[1])
+            return float(log_loss(y, probability, labels=labels))
+        losses = []
+        for output in range(y.shape[1]):
+            if np.unique(y[:, output]).size < 2:
+                continue
+            p = np.clip(probability[:, output], 1e-10, 1 - 1e-10)
+            target = y[:, output]
+            losses.append(float(np.mean(-(target * np.log(p) + (1 - target) * np.log(1 - p)))))
+        return float(np.mean(losses)) if losses else 0.0
+
+    def _maximal_code_metadata(self, n_features: int, n_pairs: int, n_fine_pairs: int):
+        metadata = []
+        for feature in range(int(n_features)):
+            for level in self.levels:
+                metadata.append(("main", int(level), feature))
+        for pair_index in range(int(n_pairs)):
+            for level in self.levels:
+                if level <= 8 or pair_index < int(n_fine_pairs):
+                    metadata.append(("pair", int(level), pair_index))
+        return metadata
+
+    @staticmethod
+    def _candidate_code_columns(metadata, config: SharedStructureConfig):
+        columns = []
+        for column, (kind, level, index) in enumerate(metadata):
+            if kind == "main" and level <= int(config.max_main_level):
+                columns.append(column)
+            elif kind == "pair":
+                if level <= 8 and index < int(config.n_pairs):
+                    columns.append(column)
+                elif level > 8 and index < int(config.n_fine_pairs):
+                    columns.append(column)
+        return columns
+
+    def _fit_structure(self, X: np.ndarray, y: np.ndarray, config: SharedStructureConfig):
+        self.encoder_ = self._new_encoder().fit(X)
+        all_states = self.encoder_.transform(X)
+        scores = _aggregate_feature_scores(all_states[self.ranking_level], y, self.task_type)
+        self.feature_idx_ = np.argsort(-scores, kind="stable")[: min(self.max_features, X.shape[1])]
+        states = {level: values[:, self.feature_idx_] for level, values in all_states.items()}
+        ranked = _rank_pairs(
+            states[self.ranking_level], y, self.task_type,
+            max(config.n_pairs, 1), self.pair_feature_limit,
+            config.pair_aggregation,
+        )
+        self.pairs_ = ranked[: config.n_pairs]
+        self.fine_pairs_ = self.pairs_[: min(config.n_fine_pairs, len(self.pairs_))]
+        self.config_ = SharedStructureConfig(
+            len(self.pairs_), len(self.fine_pairs_), config.max_main_level,
+            config.C, config.pair_aggregation, config.multiclass_objective
+        )
+        self.multiclass_objective_ = str(config.multiclass_objective)
+        self._prepare_residual_maps()
+        codes = self._build_codes(states, self.config_)
+        self.oh_ = ReferenceStateEncoder().fit(codes)
+        design = self.oh_.transform(codes)
+        fitted, _ = self._fit_outputs(design, y, config.C, config.multiclass_objective)
+        self._compile_lookup(fitted)
+        self.design_dim_ = int(design.shape[1])
+        self.operator_columns_ = int(codes.shape[1])
+        self.model_bytes_estimate_ = int(
+            sum(table.nbytes for table in self.lookup_)
+            + self.intercept_.nbytes
+            + self.encoder_.threshold_bytes_
+            + self.feature_idx_.nbytes
+            + np.asarray(self.pairs_, dtype=np.int32).nbytes
+        )
+        return self
+
+    def fit(self, X: np.ndarray, y: np.ndarray):
+        X = np.asarray(X, dtype=np.float64)
+        y = np.asarray(y, dtype=np.int32)
+        selection = self._selection_indices(y)
+        if self.task_type == "multiclass":
+            train, valid = train_test_split(
+                selection, test_size=0.22, random_state=self.random_state, stratify=y[selection]
+            )
+        else:
+            train, valid = train_test_split(
+                selection, test_size=0.22, random_state=self.random_state
+            )
+        self.selection_rows_ = int(len(selection))
+        encoder = self._new_encoder().fit(X[train])
+        states_train_all = encoder.transform(X[train])
+        states_valid_all = encoder.transform(X[valid])
+        scores = _aggregate_feature_scores(states_train_all[self.ranking_level], y[train], self.task_type)
+        idx = np.argsort(-scores, kind="stable")[: min(self.max_features, X.shape[1])]
+        st = {level: values[:, idx] for level, values in states_train_all.items()}
+        sv = {level: values[:, idx] for level, values in states_valid_all.items()}
+        configs = self._configs()
+        results = []
+        design_cache = {}
+        graph_columns = 0
+        graph_design_dim = 0
+
+        # Each aggregation has its own ranked pair bank. Candidate designs are
+        # still exact prefix/views within that bank, so no candidate rebuilds
+        # state columns or one-hot encodings.
+        configs_by_aggregation: dict[str, list[SharedStructureConfig]] = {}
+        for config in configs:
+            configs_by_aggregation.setdefault(config.pair_aggregation, []).append(config)
+
+        for aggregation, aggregation_configs in configs_by_aggregation.items():
+            max_pairs = max(config.n_pairs for config in aggregation_configs)
+            max_fine = max(config.n_fine_pairs for config in aggregation_configs)
+            ranked = _rank_pairs(
+                st[self.ranking_level], y[train], self.task_type,
+                max_pairs, self.pair_feature_limit, aggregation,
+            )
+
+            cache = object.__new__(SharedFiniteStateModel)
+            cache.__dict__.update(self.__dict__)
+            cache.encoder_ = encoder
+            cache.feature_idx_ = idx
+            cache.pairs_ = ranked[:max_pairs]
+            cache.fine_pairs_ = cache.pairs_[: min(max_fine, len(cache.pairs_))]
+            cache.config_ = SharedStructureConfig(
+                len(cache.pairs_), len(cache.fine_pairs_), self.max_bins,
+                0.2, aggregation, aggregation_configs[0].multiclass_objective
+            )
+            cache._prepare_residual_maps()
+            max_train_codes = cache._build_codes(st, cache.config_)
+            max_valid_codes = cache._build_codes(sv, cache.config_)
+            bank = EncodedColumnBank.build(
+                max_train_codes, max_valid_codes, ReferenceStateEncoder
+            )
+            metadata = self._maximal_code_metadata(
+                len(idx), len(cache.pairs_), len(cache.fine_pairs_)
+            )
+            if len(metadata) != max_train_codes.shape[1]:
+                raise RuntimeError("shared maximal code metadata mismatch")
+            graph_columns = max(graph_columns, int(max_train_codes.shape[1]))
+            graph_design_dim = max(graph_design_dim, int(bank.train.shape[1]))
+
+            for config in aggregation_configs:
+                actual = SharedStructureConfig(
+                    min(config.n_pairs, len(cache.pairs_)),
+                    min(config.n_fine_pairs, config.n_pairs, len(cache.fine_pairs_)),
+                    config.max_main_level, config.C, aggregation,
+                    config.multiclass_objective,
+                )
+                key = (aggregation, actual.n_pairs, actual.n_fine_pairs, actual.max_main_level)
+                if key not in design_cache:
+                    columns = self._candidate_code_columns(metadata, actual)
+                    design_cache[key] = bank.view(columns)
+                z_train, z_valid = design_cache[key]
+                fitted, _ = self._fit_outputs(z_train, y[train], actual.C, actual.multiclass_objective)
+                probability = self._validation_probability(fitted, z_valid)
+                loss = self._loss(y[valid], probability)
+                bytes_estimate = int(z_train.shape[1] * max(1, probability.shape[1]) * 8)
+                results.append((loss, bytes_estimate, actual))
+        results.sort(key=lambda row: (row[0], row[1]))
+        best_loss = results[0][0]
+        eligible = [row for row in results if row[0] <= best_loss + 0.0015]
+        selected = min(eligible, key=lambda row: (row[1], row[0]))[2]
+        self.validation_scores_ = results
+        self.selected_validation_loss_ = float(best_loss)
+        self.training_graph_columns_ = int(graph_columns)
+        self.training_graph_design_dim_ = int(graph_design_dim)
+        self.training_graph_design_count_ = int(len(design_cache))
+        return self._fit_structure(X, y, selected)
+
+    def _compile_lookup(self, fitted):
+        if self.task_type == "multiclass":
+            if isinstance(fitted, (list, tuple)):
+                coef = np.vstack([np.asarray(model.coef_[0], dtype=np.float64) for model in fitted])
+                intercept = np.asarray([float(model.intercept_[0]) for model in fitted], dtype=np.float64)
+                n_classes = len(fitted)
+            else:
+                coef = np.asarray(fitted.coef_, dtype=np.float64)
+                intercept = np.asarray(fitted.intercept_, dtype=np.float64)
+                n_classes = int(coef.shape[0])
+            self.classes_ = np.arange(n_classes, dtype=np.int32)
+            self.constant_outputs_ = None
+        else:
+            n_outputs = len(fitted)
+            coef = np.zeros((n_outputs, self.oh_.n_features_out_), dtype=np.float64)
+            intercept = np.zeros(n_outputs, dtype=np.float64)
+            constants = np.full(n_outputs, np.nan, dtype=np.float64)
+            for output, model in enumerate(fitted):
+                if isinstance(model, float):
+                    constants[output] = model
+                else:
+                    coef[output] = model.coef_[0]
+                    intercept[output] = model.intercept_[0]
+            self.classes_ = None
+            self.constant_outputs_ = constants
+        self.intercept_ = intercept
+        self.lookup_ = []
+        offset = 0
+        for cardinality in self.oh_.cardinalities_:
+            card = int(cardinality)
+            table = np.zeros((card, coef.shape[0]), dtype=np.float64)
+            width = max(card - 1, 0)
+            if width:
+                table[1:, :] = coef[:, offset : offset + width].T
+            offset += width
+            self.lookup_.append(table)
+        if offset != coef.shape[1]:
+            raise RuntimeError("shared coefficient layout mismatch")
+
+    def _codes(self, X):
+        all_states = self.encoder_.transform(np.asarray(X, dtype=np.float64))
+        states = {level: values[:, self.feature_idx_] for level, values in all_states.items()}
+        return self._build_codes(states, self.config_)
+
+    def decision_function(self, X):
+        codes = self._codes(X)
+        score = np.tile(self.intercept_, (len(codes), 1))
+        for column, table in enumerate(self.lookup_):
+            state = codes[:, column]
+            valid = (state >= 0) & (state < len(table))
+            score[valid] += table[state[valid]]
+        if self.task_type == "multilabel" and self.constant_outputs_ is not None:
+            for output, value in enumerate(self.constant_outputs_):
+                if np.isfinite(value):
+                    score[:, output] = 40.0 if value >= 0.5 else -40.0
+        return score
+
+    def predict_proba(self, X):
+        score = self.decision_function(X)
+        if self.task_type == "multiclass":
+            return _softmax(score)
+        probability = 1.0 / (1.0 + np.exp(-np.clip(score, -40.0, 40.0)))
+        if self.constant_outputs_ is not None:
+            for output, value in enumerate(self.constant_outputs_):
+                if np.isfinite(value):
+                    probability[:, output] = value
+        return probability
+
+    def predict(self, X):
+        probability = self.predict_proba(X)
+        if self.task_type == "multiclass":
+            return self.classes_[np.argmax(probability, axis=1)]
+        threshold = np.asarray(self.threshold, dtype=np.float64)
+        return (probability >= threshold).astype(np.int32)
+
+    @staticmethod
+    def _pack_variable(arrays, dtype):
+        arrays = [np.asarray(array, dtype=dtype).ravel() for array in arrays]
+        offsets = np.zeros(len(arrays) + 1, dtype=np.int64)
+        if arrays:
+            np.cumsum([len(array) for array in arrays], out=offsets[1:])
+            flat = np.concatenate(arrays) if offsets[-1] else np.empty(0, dtype=dtype)
+        else:
+            flat = np.empty(0, dtype=dtype)
+        return flat, offsets
+
+    @staticmethod
+    def _unpack_variable(flat, offsets):
+        flat = np.asarray(flat)
+        offsets = np.asarray(offsets, dtype=np.int64)
+        return [flat[offsets[index] : offsets[index + 1]].copy() for index in range(len(offsets) - 1)]
+
+    def export_ir(self, prefix: str | Path):
+        prefix = Path(prefix)
+        npz = prefix.with_suffix(".npz")
+        js = prefix.with_suffix(".json")
+        arrays = {
+            "feature_idx": np.asarray(self.feature_idx_, dtype=np.int32),
+            "pairs": np.asarray(self.pairs_, dtype=np.int32).reshape(-1, 2),
+            "fine_pairs": np.asarray(self.fine_pairs_, dtype=np.int32).reshape(-1, 2),
+            "direct_state_mask": np.asarray(self.encoder_.direct_state_mask_, dtype=np.uint8),
+            "direct_state_cardinalities": np.asarray(self.encoder_.direct_state_cardinalities_, dtype=np.int32),
+            "intercept": np.asarray(self.intercept_, dtype=np.float64),
+            "levels": np.asarray(self.levels, dtype=np.int16),
+            "classes": np.asarray([] if self.classes_ is None else self.classes_, dtype=np.int64),
+            "constant_outputs": np.asarray([] if self.constant_outputs_ is None else self.constant_outputs_, dtype=np.float64),
+        }
+        threshold_flat, threshold_offsets = self._pack_variable(
+            self.encoder_.thresholds_, np.float64
+        )
+        arrays["threshold_values"] = threshold_flat
+        arrays["threshold_offsets"] = threshold_offsets
+        for level in self.levels:
+            values, offsets = self._pack_variable(self.encoder_.maps_[level], np.int16)
+            arrays[f"map{level}_values"] = values
+            arrays[f"map{level}_offsets"] = offsets
+            if level > self.levels[0]:
+                values, offsets = self._pack_variable(self.main_residuals_[level], np.int32)
+                arrays[f"main_res{level}_values"] = values
+                arrays[f"main_res{level}_offsets"] = offsets
+                pairs = self.pairs_ if level <= 8 else self.fine_pairs_
+                values, offsets = self._pack_variable(
+                    [self.pair_residuals_[level][pair] for pair in pairs], np.int32
+                )
+                arrays[f"pair_res{level}_values"] = values
+                arrays[f"pair_res{level}_offsets"] = offsets
+        lookup_values, lookup_offsets = self._pack_variable(
+            [np.asarray(table, dtype=np.float64).ravel() for table in self.lookup_],
+            np.float64,
+        )
+        arrays["lookup_values"] = lookup_values
+        arrays["lookup_offsets"] = lookup_offsets
+        arrays["lookup_rows"] = np.asarray([len(table) for table in self.lookup_], dtype=np.int32)
+        np.savez_compressed(npz, **arrays)
+        manifest = {
+            "format": "cerm-shared-finite-state-v2",
+            "task_type": self.task_type,
+            "n_outputs": int(self.intercept_.size),
+            "n_input_features": int(self.encoder_.n_features_in_),
+            "max_bins": self.max_bins,
+            "levels": list(self.levels),
+            "feature_kinds": [str(value) for value in self.encoder_.feature_kinds_],
+            "feature_cardinalities": [
+                None if value is None else int(value)
+                for value in self.encoder_.feature_cardinalities_
+            ],
+            "config": self.config_.__dict__,
+            "model_bytes_estimate": self.model_bytes_estimate_,
+            "array_file": npz.name,
+            "pickle_free": True,
+            "multiclass_objective": self.multiclass_objective,
+        }
+        js.write_text(json.dumps(manifest, separators=(",", ":")), encoding="utf-8")
+        return npz, js
+
+    @classmethod
+    def load_ir(cls, json_path: str | Path, npz_path: str | Path):
+        metadata = json.loads(Path(json_path).read_text(encoding="utf-8"))
+        if metadata.get("format") != "cerm-shared-finite-state-v2":
+            raise ValueError(f"unsupported shared finite-state format: {metadata.get('format')!r}")
+        with np.load(npz_path, allow_pickle=False) as archive:
+            arrays = {name: np.asarray(archive[name]) for name in archive.files}
+        model = cls(
+            task_type=metadata["task_type"],
+            max_features=int(metadata.get("n_input_features", 1)),
+            pair_feature_limit=max(1, int(len(arrays["feature_idx"]))),
+            max_bins=int(metadata["max_bins"]),
+            feature_kinds=tuple(metadata["feature_kinds"]),
+            feature_cardinalities=tuple(metadata["feature_cardinalities"]),
+            multiclass_objective=str(metadata.get("multiclass_objective", "ovr")),
+        )
+        model.levels = tuple(int(level) for level in arrays["levels"])
+        model.ranking_level = 8 if model.max_bins >= 8 else 4
+        encoder = NestedQuantileEncoder(
+            max_bins=model.max_bins,
+            levels=model.levels,
+            feature_kinds=tuple(metadata["feature_kinds"]),
+            feature_cardinalities=tuple(metadata["feature_cardinalities"]),
+        )
+        encoder.feature_kinds_ = list(metadata["feature_kinds"])
+        encoder.feature_cardinalities_ = list(metadata["feature_cardinalities"])
+        encoder.thresholds_ = cls._unpack_variable(
+            arrays["threshold_values"], arrays["threshold_offsets"]
+        )
+        encoder.maps_ = {}
+        encoder.cardinalities_ = {}
+        for level in model.levels:
+            maps = cls._unpack_variable(
+                arrays[f"map{level}_values"], arrays[f"map{level}_offsets"]
+            )
+            encoder.maps_[level] = [np.asarray(value, dtype=np.int16) for value in maps]
+            encoder.cardinalities_[level] = np.asarray(
+                [int(value.max(initial=0)) + 1 for value in maps], dtype=np.int16
+            )
+        encoder.direct_state_mask_ = arrays["direct_state_mask"].astype(bool)
+        encoder.direct_state_cardinalities_ = arrays["direct_state_cardinalities"].astype(np.int32)
+        encoder.n_features_in_ = int(metadata["n_input_features"])
+        model.encoder_ = encoder
+        model.feature_idx_ = arrays["feature_idx"].astype(np.int32)
+        model.pairs_ = [tuple(map(int, pair)) for pair in arrays["pairs"].reshape(-1, 2)]
+        model.fine_pairs_ = [tuple(map(int, pair)) for pair in arrays["fine_pairs"].reshape(-1, 2)]
+        cfg = metadata["config"]
+        model.config_ = SharedStructureConfig(
+            int(cfg["n_pairs"]), int(cfg["n_fine_pairs"]),
+            int(cfg["max_main_level"]), float(cfg["C"]),
+            str(cfg.get("pair_aggregation", "joint")),
+            str(cfg.get("multiclass_objective", metadata.get("multiclass_objective", "ovr"))),
+        )
+        model.multiclass_objective_ = str(model.config_.multiclass_objective)
+        model.main_residuals_ = {}
+        model.pair_residuals_ = {level: {} for level in model.levels[1:]}
+        for level in model.levels[1:]:
+            model.main_residuals_[level] = [
+                np.asarray(value, dtype=np.int32)
+                for value in cls._unpack_variable(
+                    arrays[f"main_res{level}_values"], arrays[f"main_res{level}_offsets"]
+                )
+            ]
+            pairs = model.pairs_ if level <= 8 else model.fine_pairs_
+            values = cls._unpack_variable(
+                arrays[f"pair_res{level}_values"], arrays[f"pair_res{level}_offsets"]
+            )
+            model.pair_residuals_[level] = {
+                pair: np.asarray(value, dtype=np.int32)
+                for pair, value in zip(pairs, values)
+            }
+        n_outputs = int(metadata["n_outputs"])
+        lookup_flat = arrays["lookup_values"]
+        lookup_offsets = arrays["lookup_offsets"]
+        rows = arrays["lookup_rows"]
+        model.lookup_ = []
+        for index, row_count in enumerate(rows):
+            values = lookup_flat[lookup_offsets[index] : lookup_offsets[index + 1]]
+            model.lookup_.append(values.reshape(int(row_count), n_outputs).copy())
+        model.intercept_ = arrays["intercept"].astype(np.float64)
+        model.classes_ = arrays["classes"].astype(np.int64) if arrays["classes"].size else None
+        model.constant_outputs_ = arrays["constant_outputs"].astype(np.float64) if arrays["constant_outputs"].size else None
+        model.model_bytes_estimate_ = int(metadata.get("model_bytes_estimate", 0))
+        model.operator_columns_ = int(len(model.lookup_))
+        return model
+
+
+@dataclass
+class SharedFiniteStateProgram:
+    model: SharedFiniteStateModel
+    adapter: Any
+    input_columns: tuple[str, ...] | None
+    adapted_feature_names: tuple[str, ...]
+    feature_indices: tuple[int, ...] | None
+    task_type: str
+    classes: tuple[Any, ...] | None = None
+    output_names: tuple[str, ...] | None = None
+    threshold: float | tuple[float, ...] = 0.5
+    library_version: str = "unknown"
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def _prepare_input(self, X):
+        if self.adapter is None:
+            matrix = dense_numeric_matrix(X)
+        else:
+            frame = validate_dataframe_schema(X, self.input_columns or ())
+            matrix = self.adapter.transform(frame).matrix
+        if self.feature_indices is not None:
+            matrix = matrix[:, np.asarray(self.feature_indices, dtype=np.int64)]
+        return np.asarray(matrix, dtype=np.float64)
+
+    def decision_function(self, X):
+        return self.model.decision_function(self._prepare_input(X))
+
+    def predict_proba(self, X):
+        return self.model.predict_proba(self._prepare_input(X))
+
+    def predict(self, X):
+        probability = self.predict_proba(X)
+        if self.task_type == "multiclass":
+            classes = np.asarray(self.classes)
+            return classes[np.argmax(probability, axis=1)]
+        threshold = np.asarray(self.threshold, dtype=np.float64)
+        return (probability >= threshold).astype(np.int32)
+
+    @property
+    def model_bytes_estimate(self):
+        adapter_bytes = 0
+        if self.adapter is not None:
+            from .adapters import estimate_typed_adapter_bytes
+            adapter_bytes = estimate_typed_adapter_bytes(self.adapter)
+        return int(self.model.model_bytes_estimate_ + adapter_bytes)
+
+    def optimize(self, target: str = "balanced"):
+        if target not in {"memory", "balanced", "latency"}:
+            raise ValueError("target must be memory, balanced, or latency")
+        return self
+
+    def autotune(
+        self,
+        calibration_X,
+        prefix: str | Path,
+        *,
+        target: str = "latency",
+        benchmark_rows: int = 50_000,
+    ):
+        # The shared runtime currently has one exact native lowering.  Preserve
+        # the common compiler API while recording the requested objective.
+        compiled = self.compile_native(prefix)
+        compiled.metadata.update({
+            "autotune_target": target,
+            "benchmark_rows": int(benchmark_rows),
+            "candidate_count": 1,
+        })
+        return compiled
+
+    def compile_native(self, prefix: str | Path):
+        from ._internal.cerm_shared_native_codegen import compile_shared_native
+        predict, source, library = compile_shared_native(self.model, prefix)
+        return CompiledSharedFiniteStateProgram(
+            predict_matrix=predict,
+            adapter=self.adapter,
+            input_columns=self.input_columns,
+            feature_indices=self.feature_indices,
+            task_type=self.task_type,
+            classes=self.classes,
+            output_names=self.output_names,
+            threshold=self.threshold,
+            source_path=Path(source),
+            library_path=Path(library),
+            n_outputs=int(len(self.model.intercept_)),
+            metadata={**self.metadata, "backend": "shared-native-v1"},
+        )
+
+    def export(self, directory: str | Path, *, config: dict[str, Any] | None = None):
+        directory = Path(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        model_npz, model_json = self.model.export_ir(directory / "model")
+        adapter_record = None
+        if self.adapter is not None:
+            adapter_npz, adapter_json = export_typed_adapter_ir(self.adapter, directory / "adapter")
+            def rec(path: Path):
+                payload = path.read_bytes()
+                return {"file": path.name, "bytes": len(payload), "sha256": hashlib.sha256(payload).hexdigest()}
+            adapter_record = {"npz": rec(adapter_npz), "json": rec(adapter_json)}
+        def rec(path: Path):
+            payload = path.read_bytes()
+            return {"file": path.name, "bytes": len(payload), "sha256": hashlib.sha256(payload).hexdigest()}
+        manifest = {
+            "format": "cerm-shared-program-v1",
+            "library_version": self.library_version,
+            "task_type": self.task_type,
+            "classes": self.classes,
+            "output_names": self.output_names,
+            "threshold": self.threshold,
+            "input_columns": self.input_columns,
+            "adapted_feature_names": self.adapted_feature_names,
+            "feature_indices": self.feature_indices,
+            "model": {"npz": rec(model_npz), "json": rec(model_json)},
+            "adapter": adapter_record,
+            "metadata": self.metadata,
+            "config": config or {},
+            "model_bytes_estimate": self.model_bytes_estimate,
+        }
+        path = directory / "manifest.json"
+        path.write_text(json.dumps(manifest, indent=2, default=str), encoding="utf-8")
+        return path
+
+    @classmethod
+    def load(cls, directory: str | Path):
+        from .portable import PortableTypedAdapter
+
+        directory = Path(directory)
+        manifest_path = directory / "manifest.json" if directory.is_dir() else directory
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest.get("format") != "cerm-shared-program-v1":
+            raise ValueError("unsupported shared program format")
+        def verify(record):
+            path = manifest_path.parent / record["file"]
+            payload = path.read_bytes()
+            if len(payload) != int(record["bytes"]):
+                raise ValueError(f"byte-count mismatch for {path.name}")
+            if hashlib.sha256(payload).hexdigest() != record["sha256"]:
+                raise ValueError(f"SHA-256 mismatch for {path.name}")
+            return path
+        model = SharedFiniteStateModel.load_ir(
+            verify(manifest["model"]["json"]),
+            verify(manifest["model"]["npz"]),
+        )
+        adapter = None
+        if manifest.get("adapter") is not None:
+            adapter = PortableTypedAdapter.load(
+                verify(manifest["adapter"]["json"]),
+                verify(manifest["adapter"]["npz"]),
+            )
+        threshold = manifest.get("threshold", 0.5)
+        if isinstance(threshold, list):
+            threshold = tuple(float(value) for value in threshold)
+        classes = manifest.get("classes")
+        output_names = manifest.get("output_names")
+        feature_indices = manifest.get("feature_indices")
+        input_columns = manifest.get("input_columns")
+        return cls(
+            model=model,
+            adapter=adapter,
+            input_columns=tuple(input_columns) if input_columns is not None else None,
+            adapted_feature_names=tuple(manifest.get("adapted_feature_names") or ()),
+            feature_indices=tuple(feature_indices) if feature_indices is not None else None,
+            task_type=manifest["task_type"],
+            classes=tuple(classes) if classes is not None else None,
+            output_names=tuple(output_names) if output_names is not None else None,
+            threshold=threshold,
+            library_version=manifest.get("library_version", "unknown"),
+            metadata=dict(manifest.get("metadata") or {}),
+        )
+
+@dataclass
+class CompiledSharedFiniteStateProgram:
+    predict_matrix: Any
+    adapter: Any
+    input_columns: tuple[str, ...] | None
+    feature_indices: tuple[int, ...] | None
+    task_type: str
+    classes: tuple[Any, ...] | None
+    output_names: tuple[str, ...] | None
+    threshold: float | tuple[float, ...]
+    source_path: Path
+    library_path: Path
+    n_outputs: int
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def _prepare_input(self, X):
+        if self.adapter is None:
+            matrix = dense_numeric_matrix(X)
+        else:
+            frame = validate_dataframe_schema(X, self.input_columns or ())
+            matrix = self.adapter.transform(frame).matrix
+        if self.feature_indices is not None:
+            matrix = matrix[:, np.asarray(self.feature_indices, dtype=np.int64)]
+        return np.asarray(matrix, dtype=np.float64)
+
+    def predict_proba(self, X):
+        return np.asarray(self.predict_matrix(self._prepare_input(X)), dtype=np.float64)
+
+    def predict(self, X):
+        probability = self.predict_proba(X)
+        if self.task_type == "multiclass":
+            return np.asarray(self.classes)[np.argmax(probability, axis=1)]
+        return (probability >= np.asarray(self.threshold, dtype=np.float64)).astype(np.int32)
+
+    @staticmethod
+    def _record(path: Path):
+        payload = path.read_bytes()
+        return {"file": path.name, "bytes": len(payload), "sha256": hashlib.sha256(payload).hexdigest()}
+
+    def save(self, directory: str | Path, *, include_source: bool = False):
+        import platform
+        import shutil
+
+        directory = Path(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        library = directory / self.library_path.name
+        shutil.copy2(self.library_path, library)
+        source_record = None
+        if include_source and self.source_path.is_file():
+            source = directory / self.source_path.name
+            shutil.copy2(self.source_path, source)
+            source_record = self._record(source)
+        adapter_record = None
+        if self.adapter is not None:
+            if hasattr(self.adapter, "export") and self.adapter.__class__.__name__ == "PortableTypedAdapter":
+                adapter_npz, adapter_json = self.adapter.export(directory / "adapter")
+                portable = True
+            else:
+                adapter_npz, adapter_json = export_typed_adapter_ir(self.adapter, directory / "adapter")
+                portable = bool(json.loads(adapter_json.read_text(encoding="utf-8")).get("portable", False))
+            if not portable:
+                adapter_npz.unlink(missing_ok=True)
+                adapter_json.unlink(missing_ok=True)
+                raise ValueError("shared compiled program requires a portable adapter")
+            adapter_record = {"npz": self._record(adapter_npz), "json": self._record(adapter_json)}
+        runtime = directory / "runtime.json"
+        runtime.write_text(json.dumps({
+            "input_columns": self.input_columns,
+            "feature_indices": self.feature_indices,
+            "task_type": self.task_type,
+            "classes": self.classes,
+            "output_names": self.output_names,
+            "threshold": self.threshold,
+            "n_outputs": self.n_outputs,
+            "metadata": self.metadata,
+        }, indent=2, default=str), encoding="utf-8")
+        manifest = {
+            "format": "cerm-compiled-shared-program-v1",
+            "library": self._record(library),
+            "source": source_record,
+            "runtime": self._record(runtime),
+            "adapter": adapter_record,
+            "symbol": "cerm_shared_predict",
+            "machine": platform.machine(),
+            "system": platform.system(),
+        }
+        path = directory / "manifest.json"
+        path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        return path
+
+    @classmethod
+    def load(cls, directory: str | Path):
+        import platform
+        from .native_runtime import load_native_matrix_predictor
+        from .portable import PortableTypedAdapter
+
+        directory = Path(directory)
+        manifest_path = directory / "manifest.json" if directory.is_dir() else directory
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest.get("format") != "cerm-compiled-shared-program-v1":
+            raise ValueError("unsupported compiled shared program format")
+        if manifest.get("machine") != platform.machine() or manifest.get("system") != platform.system():
+            raise RuntimeError("compiled shared program targets a different platform")
+        def verify(record):
+            path = manifest_path.parent / record["file"]
+            payload = path.read_bytes()
+            if len(payload) != int(record["bytes"]) or hashlib.sha256(payload).hexdigest() != record["sha256"]:
+                raise ValueError(f"artifact verification failed: {path.name}")
+            return path
+        library = verify(manifest["library"])
+        runtime = json.loads(verify(manifest["runtime"]).read_text(encoding="utf-8"))
+        adapter_record = manifest.get("adapter")
+        adapter = None
+        if adapter_record is not None:
+            adapter = PortableTypedAdapter.load(verify(adapter_record["json"]), verify(adapter_record["npz"]))
+        predictor = load_native_matrix_predictor(
+            library, n_outputs=int(runtime["n_outputs"]), symbol=manifest.get("symbol", "cerm_shared_predict")
+        )
+        source_record = manifest.get("source")
+        source = verify(source_record) if source_record else manifest_path.parent / "unavailable.cpp"
+        return cls(
+            predict_matrix=predictor,
+            adapter=adapter,
+            input_columns=tuple(runtime["input_columns"]) if runtime.get("input_columns") is not None else None,
+            feature_indices=tuple(runtime["feature_indices"]) if runtime.get("feature_indices") is not None else None,
+            task_type=runtime["task_type"],
+            classes=tuple(runtime["classes"]) if runtime.get("classes") is not None else None,
+            output_names=tuple(runtime["output_names"]) if runtime.get("output_names") is not None else None,
+            threshold=tuple(runtime["threshold"]) if isinstance(runtime.get("threshold"), list) else runtime.get("threshold", 0.5),
+            source_path=source,
+            library_path=library,
+            n_outputs=int(runtime["n_outputs"]),
+            metadata=dict(runtime.get("metadata") or {}),
+        )

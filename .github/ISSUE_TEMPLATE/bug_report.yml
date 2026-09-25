@@ -1,0 +1,45 @@
+name: Bug report
+description: Report a reproducible defect in CERM
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: "Thank you for reporting a problem. Do not attach confidential data or untrusted serialized models."
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Provide the smallest runnable example and any synthetic data needed.
+      render: python
+    validations:
+      required: true
+  - type: textarea
+    id: versions
+    attributes:
+      label: Environment
+      description: Paste the output of `cerm.show_versions()`.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Model diagnostics
+      description: Include parameters, `resolved_params_`, and relevant `fit_diagnostics_` fields.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched existing issues.
+          required: true
+        - label: The example does not contain private or sensitive data.
+          required: true

@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      full:
+        description: "Run cross-platform, estimator, and distribution checks"
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  core:
+    name: Core / Ubuntu / Python 3.12
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[test,docs]" "ruff>=0.5,<1"
+      - name: Remove editable-install metadata before repository hygiene checks
+        shell: bash
+        run: find src -maxdepth 1 -type d -name '*.egg-info' -prune -exec rm -rf {} +
+      - name: Package and API checks
+        run: |
+          python scripts/check_package.py
+          python scripts/check_documentation.py
+          python scripts/check_public_api.py
+          python scripts/check_runtime_dependencies.py
+      - name: Lint
+        run: python -m ruff check src tests scripts examples
+      - name: Tests and coverage
+        run: python -m pytest --cov=cerm --cov-report=term-missing
+      - name: Documentation
+        run: python -m mkdocs build --strict
+      - run: python -m pip check
+
+  platform-tests:
+    name: Full / ${{ matrix.os }} / Python ${{ matrix.python-version }}
+    if: github.event_name == 'workflow_dispatch' && inputs.full
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python-version: "3.10"
+          - os: ubuntu-latest
+            python-version: "3.13"
+          - os: macos-latest
+            python-version: "3.12"
+          - os: windows-latest
+            python-version: "3.12"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[test]"
+      - run: python -m pytest
+      - run: python -m pip check
+
+  full-validation:
+    name: Full / Estimator and distribution
+    if: github.event_name == 'workflow_dispatch' && inputs.full
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[dev]"
+      - name: Estimator checks
+        run: python scripts/run_estimator_checks.py
+      - name: Build and verify distributions
+        run: |
+          find . -type d -name __pycache__ -prune -exec rm -rf {} +
+          find src -maxdepth 1 -type d -name '*.egg-info' -prune -exec rm -rf {} +
+          python scripts/check_package.py
+          python scripts/check_documentation.py
+          python scripts/check_public_api.py
+          python scripts/check_runtime_dependencies.py
+          python -m build
+          python scripts/verify_distributions.py dist/*
+          python -m twine check dist/*
+          python -m pip install --force-reinstall dist/*.whl
+          python scripts/smoke_install.py

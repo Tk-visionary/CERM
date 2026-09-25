@@ -1,0 +1,26 @@
+site_name: CERM
+site_description: Compiler-oriented finite-state models for tabular classification and regression
+docs_dir: docs
+theme:
+  name: material
+nav:
+  - Home: index.md
+  - Getting started: getting_started.md
+  - API reference: api_reference.md
+  - Fused regression V2: fused_regression.md
+  - Model inspection: inspection.md
+  - Validation errors: errors.md
+  - Installation: installation.md
+  - Parameters: parameters.md
+  - Public parameter inventory: parameter_inventory.md
+  - Task support: tasks.md
+  - Advanced usage: advanced_usage.md
+  - Architecture: architecture.md
+  - Limitations: limitations.md
+  - API stability: api_stability.md
+  - Compatibility: compatibility.md
+  - Benchmark policy: benchmarking.md
+  - Security: security.md
+  - Roadmap: roadmap.md
+  - Code provenance: code_provenance.md
+  - Release checklist: release_checklist.md
