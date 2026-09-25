@@ -1,7 +1,9 @@
 # CERM
 
 [![CI](https://github.com/Tk-visionary/CERM/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Tk-visionary/CERM/actions/workflows/ci.yml)
-[![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![PyPI](https://img.shields.io/pypi/v/CERM.svg)](https://pypi.org/project/CERM/)
+[![Python](https://img.shields.io/pypi/pyversions/CERM.svg)](https://pypi.org/project/CERM/)
+[![Downloads](https://api.pepy.tech/badge/CERM)](https://pepy.tech/project/CERM)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](./LICENSE)
 [![scikit-learn](https://img.shields.io/badge/scikit--learn-compatible-F7931E?logo=scikitlearn&logoColor=white)](https://scikit-learn.org/)
 [![Status](https://img.shields.io/badge/status-alpha-orange)](docs/api_stability.md)
@@ -45,10 +47,16 @@ ensemble.
 ## Installation
 
 The PyPI distribution name is `CERM`; the Python import name is `cerm`.
-After the first public release is visible on PyPI:
+CERM is currently published as an alpha release:
 
 ```bash
-python -m pip install CERM
+python -m pip install --pre CERM
+```
+
+To install the exact current release:
+
+```bash
+python -m pip install CERM==1.0.0a1
 ```
 
 For an unreleased source checkout:
