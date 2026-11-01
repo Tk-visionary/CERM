@@ -268,4 +268,4 @@ jobs:
           test "$(find dist -maxdepth 1 -type f -name '*.whl' | wc -l | tr -d ' ')" -eq 3
           test "$(find dist -maxdepth 1 -type f -name '*.tar.gz' | wc -l | tr -d ' ')" -eq 1
       - name: Publish package distributions to PyPI
-        uses: pypa/gh-action-pypi-publish@v1.14.2
+        uses: pypa/gh-action-pypi-publish@v1.14.3
